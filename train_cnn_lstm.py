@@ -98,7 +98,7 @@ if __name__ == "__main__":
         print(classification_report(y_test, y_pred, target_names=["Not Opening (0)", "Opening (1)"]))
         
     print("\n========================================")
-    print(f"FINAL CNN-LSTM LOSO RESULTS")
-    print(f"Average Accuracy: {np.mean(accuracies):.4f}")
-    print(f"Average F1-Score: {np.mean(f1_scores):.4f}")
+    print(f"Final CNN-LSTM LOSO results")
+    print(f"Average accuracy: {np.mean(accuracies):.4f}")
+    print(f"Average F1-score: {np.mean(f1_scores):.4f}")
     print("========================================\n")

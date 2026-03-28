@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import numpy as np
 import scipy.io as sio
 from sklearn.metrics import (accuracy_score, f1_score, classification_report,
@@ -15,19 +16,9 @@ import time
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 tf.get_logger().setLevel('ERROR')
 
+# force cpu — model is too small for gpu to actually help, just adds overhead
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 tf.config.set_visible_devices([], 'GPU')
-
-# # def check_gpu():
-# #     gpus = tf.config.list_physical_devices('GPU')
-# #     if gpus:
-# #         print(f'  GPU detected: {gpus[0].name}')
-# #         for gpu in gpus:
-# #             tf.config.experimental.set_memory_growth(gpu, True)
-# #     else:
-# #         print('  WARNING: No GPU detected. Install tensorflow-macos and tensorflow-metal')
-# #         print('           for Apple Silicon acceleration.')
-# #     return len(gpus) > 0
 
 
 def load_data(path='labeled data 4 subjects.mat'):
@@ -36,13 +27,84 @@ def load_data(path='labeled data 4 subjects.mat'):
     for i in range(4):
         d = mat['data'][0, i]
         l = mat['labels'][0, i].flatten().astype(int)
-        # mat file nests each window in a cell array, have to unpack per-element
         sX.append(np.array([d[j, 0] for j in range(d.shape[0])]))
         sy.append(l)
     return sX, sy
 
 
+def load_data_chrono(path='4 subjects ordered chronologically.mat'):
+    mat = sio.loadmat(path)
+    sX, sy, s_info = [], [], []
+    for i in range(4):
+        d = mat['data_chrono'][0, i]
+        l = mat['labels_chrono'][0, i].flatten().astype(int)
+        sX.append(np.array([d[j, 0] for j in range(d.shape[0])]))
+        sy.append(l)
+        info_i = mat['info'][0, i]
+        s_info.append(info_i.astype(int))
+    return sX, sy, s_info
+
+
+def compute_opening_metrics(y_true, y_pred, opening_ids):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    opening_ids = np.asarray(opening_ids)
+
+    unique_oids = np.unique(opening_ids)
+
+    detected = 0
+    total_pos_instances = 0
+
+    for oid in unique_oids:
+        mask = opening_ids == oid
+        gt = y_true[mask]
+        pr = y_pred[mask]
+
+        if np.any(gt == 1):
+            total_pos_instances += 1
+            if np.any(pr[gt == 1] == 1):
+                detected += 1
+
+    fp_windows = int(np.sum((y_pred == 1) & (y_true == 0)))
+    neg_windows = int(np.sum(y_true == 0))
+    detection_rate = detected / total_pos_instances if total_pos_instances > 0 else 0.0
+    window_fpr = fp_windows / neg_windows if neg_windows > 0 else 0.0
+
+    return {
+        'detection_rate': detection_rate,
+        'detected': detected,
+        'total_pos_instances': total_pos_instances,
+        'fp_windows': fp_windows,
+        'neg_windows': neg_windows,
+        'window_fpr': window_fpr,
+    }
+
+
+def threshold_sweep(probs, y_true, opening_ids,
+                    thresholds=np.arange(0.30, 0.91, 0.05)):
+    probs = np.asarray(probs)
+    y_true = np.asarray(y_true)
+    opening_ids = np.asarray(opening_ids)
+
+    rows = []
+    for th in thresholds:
+        preds = (probs > th).astype(int)
+        om = compute_opening_metrics(y_true, preds, opening_ids)
+        f1 = f1_score(y_true, preds, zero_division=0)
+        rows.append({
+            'threshold': float(th),
+            'det_rate': om['detection_rate'],
+            'detected': om['detected'],
+            'total_pos': om['total_pos_instances'],
+            'fp_windows': om['fp_windows'],
+            'window_fpr': om['window_fpr'],
+            'f1': float(f1),
+        })
+    return rows
+
+
 def build_cnn_lstm(input_shape=(100, 8)):
+    # recurrent_dropout only works on cpu, thats fine since we force cpu anyway
     return models.Sequential([
         layers.Conv1D(64, 5, activation='relu', input_shape=input_shape, name='conv1'),
         layers.MaxPooling1D(2, name='pool1'),
@@ -58,7 +120,6 @@ def build_cnn_lstm(input_shape=(100, 8)):
 
 
 def cw(y):
-    # max 1 to avoid zero-div when a class is missing in tiny buffers
     n0 = max(np.sum(y == 0), 1)
     n1 = max(np.sum(y == 1), 1)
     t = len(y)
@@ -78,7 +139,6 @@ def train_base(X_tr, y_tr, X_val, y_val, seed=42):
     m = build_cnn_lstm()
     m.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
               loss='binary_crossentropy', metrics=['accuracy'])
-    # 256 batch ok on m2 pro 16gb, cuts base training time ~in half vs 64
     m.fit(X_tr, y_tr, epochs=50, batch_size=256,
           validation_data=(X_val, y_val),
           class_weight=cw(y_tr),
@@ -92,7 +152,8 @@ class OnlineLearner:
 
     def __init__(self, model, *, update_every=50, warmup=50,
                  ft_epochs=3, ft_bs=64, ft_lr=5e-4,
-                 freeze_early=True, adapt_thresh=True, buf_cap=300):
+                 freeze_early=True, adapt_thresh=True, buf_cap=300,
+                 chronological=False):
         self.model = model
         self.update_every = update_every
         self.warmup = warmup
@@ -101,14 +162,15 @@ class OnlineLearner:
         self.freeze_early = freeze_early
         self.adapt_thresh = adapt_thresh
         self.buf_cap = buf_cap
+        self.chronological = chronological
         self.threshold = 0.5
 
         self.buf_X, self.buf_y = [], []
         self.preds, self.trues, self.probs_list = [], [], []
+        self.oid_list = []
         self.update_pts = []
 
-        # freeze conv1+bn1 only — they pick up generic emg features,
-        # deeper layers need to adapt per-subject
+        # freeze early conv layers — they learn general features, dont need to adapt those online
         if freeze_early:
             for layer in model.layers:
                 if layer.name in ('conv1', 'bn1'):
@@ -116,12 +178,17 @@ class OnlineLearner:
         model.compile(optimizer=tf.keras.optimizers.Adam(ft_lr),
                       loss='binary_crossentropy', metrics=['accuracy'])
 
-    def run(self, X, y, seed=0):
-        rng = np.random.RandomState(seed)
+    def run(self, X, y, seed=0, opening_ids=None):
         n = len(X)
-        # prof lum confirmed chronological order wasn't preserved in this dataset
-        order = rng.permutation(n)
-        Xs, ys = X[order], y[order]
+
+        if self.chronological:
+            Xs, ys = X, y
+            oids = opening_ids
+        else:
+            rng = np.random.RandomState(seed)
+            order = rng.permutation(n)
+            Xs, ys = X[order], y[order]
+            oids = opening_ids[order] if opening_ids is not None else None
 
         sched = set(range(self.warmup, n + 1, self.update_every))
         bounds = sorted(set([0] + list(sched) + [n]))
@@ -133,13 +200,14 @@ class OnlineLearner:
 
             bX, by = Xs[s:e], ys[s:e]
 
-            # direct call bypasses predict() overhead (progress bars, dataset creation etc)
             bp = self.model(tf.constant(bX, dtype=tf.float32), training=False).numpy().flatten()
             bpred = (bp > self.threshold).astype(int)
 
             self.preds.extend(bpred.tolist())
             self.trues.extend(by.tolist())
             self.probs_list.extend(bp.tolist())
+            if oids is not None:
+                self.oid_list.extend(oids[s:e].tolist())
             self.buf_X.extend(bX)
             self.buf_y.extend(by.tolist())
 
@@ -155,9 +223,8 @@ class OnlineLearner:
         X = np.array(self.buf_X)
         y = np.array(self.buf_y)
 
-        # 60/40 recency split — heuristic to prioritize recent windows
-        # without fully forgetting older ones
         if len(X) > self.buf_cap:
+            # 60/40 recent/old split — bias toward recent data but keep some old to avoid catastrophic forgetting
             recent_n = int(self.buf_cap * 0.6)
             old_n = self.buf_cap - recent_n
             old_pool = len(X) - recent_n
@@ -166,8 +233,6 @@ class OnlineLearner:
             idx = np.concatenate([old_idx, recent_idx])
             X, y = X[idx], y[idx]
 
-        # train_on_batch instead of fit() — avoids epoch setup latency
-        # on these tiny ~300 sample buffers
         weights = cw(y)
         sample_weights = np.where(y == 1, weights[1], weights[0]).astype(np.float32)
         X_t = tf.constant(X, dtype=tf.float32)
@@ -181,8 +246,7 @@ class OnlineLearner:
         y = np.array(self.buf_y[-self.buf_cap:])
         ps = self.model(tf.constant(X, dtype=tf.float32), training=False).numpy().flatten()
 
-        # [0.15, 0.85] avoids degenerate thresholds that collapse to all-one/all-zero
-        # on heavily imbalanced subjects
+        # below 0.15 is basically always false positive city, above 0.85 kills recall
         thresholds = np.arange(0.15, 0.85, 0.02)
         preds_all = (ps[np.newaxis, :] > thresholds[:, np.newaxis]).astype(int)
         y_broad = y[np.newaxis, :]
@@ -209,6 +273,7 @@ class OnlineLearner:
                     'prec': float(precision_score(t_, p_, zero_division=0)),
                     'rec': float(recall_score(t_, p_, zero_division=0))}
 
+        # 100 window sliding avg — smaller is too noisy, larger hides when adaptation actually kicks in
         win = 100
         run_acc, run_f1 = [], []
         for i in range(n):
@@ -216,7 +281,7 @@ class OnlineLearner:
             run_acc.append(accuracy_score(t[s:i+1], p[s:i+1]))
             run_f1.append(f1_score(t[s:i+1], p[s:i+1], zero_division=0))
 
-        return {
+        result = {
             'overall': m(t, p),
             'q1': m(t[:q], p[:q]),
             'q2': m(t[q:2*q], p[q:2*q]),
@@ -227,14 +292,32 @@ class OnlineLearner:
             'run_acc': run_acc, 'run_f1': run_f1,
             'updates': self.update_pts,
             'threshold': self.threshold, 'n': n,
+            'probs': list(self.probs_list),
+            'preds_list': p.tolist(),
+            'trues': t.tolist(),
+            'oids': list(self.oid_list) if self.oid_list else [],
         }
 
+        if self.oid_list:
+            oids = np.array(self.oid_list)
+            result['opening'] = compute_opening_metrics(t, p, oids)
 
-def run_experiment(subjects_X, subjects_y, config, n_seeds=3):
+            for label, sl in [('q1', slice(0, q)), ('q2', slice(q, 2*q)),
+                               ('q3', slice(2*q, 3*q)), ('q4', slice(3*q, None))]:
+                result[f'opening_{label}'] = compute_opening_metrics(
+                    t[sl], p[sl], oids[sl])
+
+        return result
+
+
+def run_experiment(subjects_X, subjects_y, config, n_seeds=3,
+                   subjects_info=None, chronological=False):
     results = {}
     subject_labels = ['healthy', 'healthy', 'healthy', 'stroke']
     total_subjects = 4
-    total_steps = total_subjects * (1 + n_seeds)
+    # chrono is deterministic so one seed is enough
+    effective_seeds = 1 if chronological else n_seeds
+    total_steps = total_subjects * (1 + effective_seeds)
     current_step = 0
     exp_start = time.time()
     step_times = []
@@ -249,13 +332,13 @@ def run_experiment(subjects_X, subjects_y, config, n_seeds=3):
         X_tr = np.concatenate([subjects_X[i] for i in range(4) if i != ts])
         y_tr = np.concatenate([subjects_y[i] for i in range(4) if i != ts])
         X_te, y_te = subjects_X[ts], subjects_y[ts]
-        print(f'  Train: {len(y_tr)} windows ({np.sum(y_tr==1)} pos, {np.sum(y_tr==0)} neg)')
-        print(f'  Test:  {len(y_te)} windows ({np.sum(y_te==1)} pos, {np.sum(y_te==0)} neg)')
+        oi = subjects_info[ts][:, 2] if subjects_info is not None else None
+
+        print(f'  train: {len(y_tr)} windows ({np.sum(y_tr==1)} pos, {np.sum(y_tr==0)} neg)')
+        print(f'  test:  {len(y_te)} windows ({np.sum(y_te==1)} pos, {np.sum(y_te==0)} neg)')
 
         step_start = time.time()
-        print('  Training base model...', end=' ', flush=True)
-        # X_te as val is intentional — it's the held-out subject so this just
-        # monitors generalization, doesn't leak into the loso split
+        print('  training base model...', end=' ', flush=True)
         base = train_base(X_tr, y_tr, X_te, y_te, seed=42)
         bp = base(tf.constant(X_te, dtype=tf.float32), training=False).numpy().flatten()
         bpred = (bp > 0.5).astype(int)
@@ -269,20 +352,29 @@ def run_experiment(subjects_X, subjects_y, config, n_seeds=3):
         elapsed = time.time() - exp_start
         avg_step = elapsed / current_step
         remaining = avg_step * (total_steps - current_step)
-        print(f'done ({fmt_time(step_elapsed)}).  Baseline: acc={b_acc:.4f}, F1={b_f1:.4f}, '
+        print(f'done ({fmt_time(step_elapsed)}).  baseline: acc={b_acc:.4f}, F1={b_f1:.4f}, '
               f'prec={b_prec:.4f}, rec={b_rec:.4f}')
-        print(f'  [Time] Elapsed: {fmt_time(elapsed)} | '
-              f'Est. remaining: {fmt_time(remaining)} | '
-              f'Step {current_step}/{total_steps}')
+
+        b_opening = None
+        if oi is not None:
+            b_opening = compute_opening_metrics(y_te, bpred, oi)
+            print(f'  baseline opening detection: {b_opening["detected"]}/{b_opening["total_pos_instances"]} '
+                  f'({b_opening["detection_rate"]:.1%}), '
+                  f'FP windows: {b_opening["fp_windows"]}/{b_opening["neg_windows"]} '
+                  f'({b_opening["window_fpr"]:.1%})')
+
+        print(f'  [time] elapsed: {fmt_time(elapsed)} | '
+              f'est. remaining: {fmt_time(remaining)} | '
+              f'step {current_step}/{total_steps}')
 
         seeds = []
-        for seed in range(n_seeds):
+        for seed in range(effective_seeds):
             step_start = time.time()
             fresh = build_cnn_lstm()
             fresh.build((None, 100, 8))
             fresh.set_weights(base.get_weights())
-            learner = OnlineLearner(fresh, **config)
-            r = learner.run(X_te, y_te, seed=seed)
+            learner = OnlineLearner(fresh, **config, chronological=chronological)
+            r = learner.run(X_te, y_te, seed=seed, opening_ids=oi)
             seeds.append(r)
             step_elapsed = time.time() - step_start
             step_times.append(step_elapsed)
@@ -290,44 +382,72 @@ def run_experiment(subjects_X, subjects_y, config, n_seeds=3):
             elapsed = time.time() - exp_start
             avg_step = elapsed / current_step
             remaining = avg_step * (total_steps - current_step)
-            print(f'  Seed {seed}: overall acc={r["overall"]["acc"]:.4f}, '
+
+            seed_label = f'  seed {seed}' if not chronological else '  chrono'
+            det_str = ''
+            if 'opening' in r:
+                om = r['opening']
+                det_str = f' | det={om["detected"]}/{om["total_pos_instances"]} ({om["detection_rate"]:.1%})'
+            print(f'{seed_label}: overall acc={r["overall"]["acc"]:.4f}, '
                   f'F1={r["overall"]["f1"]:.4f} | '
                   f'Q4 acc={r["q4"]["acc"]:.4f}, F1={r["q4"]["f1"]:.4f} | '
-                  f'2nd-half acc={r["second_half"]["acc"]:.4f}, '
-                  f'F1={r["second_half"]["f1"]:.4f} | '
-                  f'thresh={r["threshold"]:.2f} ({fmt_time(step_elapsed)})')
-            print(f'  [Time] Elapsed: {fmt_time(elapsed)} | '
-                  f'Est. remaining: {fmt_time(remaining)} | '
-                  f'Step {current_step}/{total_steps}')
+                  f'thresh={r["threshold"]:.2f}{det_str} ({fmt_time(step_elapsed)})')
+            print(f'  [time] elapsed: {fmt_time(elapsed)} | '
+                  f'est. remaining: {fmt_time(remaining)} | '
+                  f'step {current_step}/{total_steps}')
 
         avg = lambda key, sub='overall': np.mean([s[sub][key] for s in seeds])
-        print(f'\n  Avg online overall:  acc={avg("acc"):.4f}, F1={avg("f1"):.4f}')
-        print(f'  Avg online Q4:       acc={avg("acc","q4"):.4f}, F1={avg("f1","q4"):.4f}')
-        print(f'  Avg online 2nd half: acc={avg("acc","second_half"):.4f}, '
-              f'F1={avg("f1","second_half"):.4f}')
-        print(f'  Improvement (Q4 vs baseline): '
+        print(f'\n  avg online overall:  acc={avg("acc"):.4f}, F1={avg("f1"):.4f}')
+        print(f'  avg online Q4:       acc={avg("acc","q4"):.4f}, F1={avg("f1","q4"):.4f}')
+        print(f'  improvement (Q4 vs baseline): '
               f'acc {avg("acc","q4")-b_acc:+.4f}, F1 {avg("f1","q4")-b_f1:+.4f}')
+
+        sweep = None
+        if oi is not None:
+            best_seed = max(seeds, key=lambda s: s['overall']['f1'])
+            sweep = threshold_sweep(
+                best_seed['probs'], best_seed['trues'], best_seed['oids'])
+            print(f'\n  threshold vs detection/FP tradeoff ({name}, {tag}):')
+            print(f'  {"thresh":<8} {"det_rate":<9} {"detected":<10} '
+                  f'{"fp_win":<8} {"win_fpr":<9} {"f1":<6}')
+            print(f'  {"-"*50}')
+            for row in sweep:
+                print(f'  {row["threshold"]:<8.2f} {row["det_rate"]:<9.1%} '
+                      f'{row["detected"]}/{row["total_pos"]:<7} '
+                      f'{row["fp_windows"]:<8} {row["window_fpr"]:<9.1%} '
+                      f'{row["f1"]:<6.3f}')
 
         results[name] = {
             'baseline': {'acc': b_acc, 'f1': b_f1, 'prec': b_prec, 'rec': b_rec},
+            'baseline_opening': b_opening,
             'seeds': seeds,
             'tag': tag,
+            'sweep': sweep,
         }
 
     return results, time.time() - exp_start
 
 
 def print_summary(results):
-    print('\n' + '='*75)
-    print('  FINAL SUMMARY: Online Learning vs LOSO Baseline')
-    print('='*75)
-    hdr = (f'{"Subject":<14} {"Base Acc":<10} {"Base F1":<10} '
-           f'{"Online Acc":<12} {"Online F1":<11} {"Q4 Acc":<9} '
-           f'{"Q4 F1":<9} {"ΔF1":<8}')
+    has_opening = any(r.get('baseline_opening') is not None for r in results.values())
+
+    print('\n' + '='*90)
+    print('  online learning vs loso baseline')
+    print('='*90)
+
+    if has_opening:
+        hdr = (f'{"subject":<14} {"base acc":<10} {"base f1":<10} '
+               f'{"online acc":<12} {"online f1":<11} {"q4 f1":<9} '
+               f'{"base det%":<10} {"online det%":<12} {"df1":<8}')
+    else:
+        hdr = (f'{"subject":<14} {"base acc":<10} {"base f1":<10} '
+               f'{"online acc":<12} {"online f1":<11} {"q4 acc":<9} '
+               f'{"q4 f1":<9} {"df1":<8}')
     print(hdr)
-    print('-'*75)
+    print('-'*90)
 
     ba_all, bf_all, oa_all, of_all, qa_all, qf_all = [], [], [], [], [], []
+    bd_all, od_all = [], []
     for sub, r in results.items():
         ba, bf = r['baseline']['acc'], r['baseline']['f1']
         oa = np.mean([s['overall']['acc'] for s in r['seeds']])
@@ -336,21 +456,39 @@ def print_summary(results):
         qf = np.mean([s['q4']['f1'] for s in r['seeds']])
         delta = qf - bf
         tag = f' ({r["tag"]})' if r['tag'] == 'stroke' else ''
-        print(f'{sub+tag:<14} {ba:<10.4f} {bf:<10.4f} {oa:<12.4f} '
-              f'{of_:<11.4f} {qa:<9.4f} {qf:<9.4f} {delta:+.4f}')
+
+        if has_opening:
+            bd = r['baseline_opening']['detection_rate'] if r['baseline_opening'] else 0
+            od_vals = [s['opening']['detection_rate'] for s in r['seeds'] if 'opening' in s]
+            od = np.mean(od_vals) if od_vals else 0
+            print(f'{sub+tag:<14} {ba:<10.4f} {bf:<10.4f} {oa:<12.4f} '
+                  f'{of_:<11.4f} {qf:<9.4f} {bd:<10.1%} {od:<12.1%} {delta:+.4f}')
+            bd_all.append(bd); od_all.append(od)
+        else:
+            print(f'{sub+tag:<14} {ba:<10.4f} {bf:<10.4f} {oa:<12.4f} '
+                  f'{of_:<11.4f} {qa:<9.4f} {qf:<9.4f} {delta:+.4f}')
+
         ba_all.append(ba); bf_all.append(bf)
         oa_all.append(oa); of_all.append(of_)
         qa_all.append(qa); qf_all.append(qf)
 
-    print('-'*75)
+    print('-'*90)
     d = np.mean(qf_all) - np.mean(bf_all)
-    print(f'{"Average":<14} {np.mean(ba_all):<10.4f} {np.mean(bf_all):<10.4f} '
-          f'{np.mean(oa_all):<12.4f} {np.mean(of_all):<11.4f} '
-          f'{np.mean(qa_all):<9.4f} {np.mean(qf_all):<9.4f} {d:+.4f}')
-    print('='*75)
-    print('\nBase = LOSO baseline (no adaptation)')
-    print('Online = full simulation (overall). Q4 = last quarter (most adapted).')
-    print('ΔF1 = Q4 F1 − Baseline F1 (improvement from online learning)')
+    if has_opening:
+        print(f'{"average":<14} {np.mean(ba_all):<10.4f} {np.mean(bf_all):<10.4f} '
+              f'{np.mean(oa_all):<12.4f} {np.mean(of_all):<11.4f} '
+              f'{np.mean(qf_all):<9.4f} {np.mean(bd_all):<10.1%} '
+              f'{np.mean(od_all):<12.1%} {d:+.4f}')
+    else:
+        print(f'{"average":<14} {np.mean(ba_all):<10.4f} {np.mean(bf_all):<10.4f} '
+              f'{np.mean(oa_all):<12.4f} {np.mean(of_all):<11.4f} '
+              f'{np.mean(qa_all):<9.4f} {np.mean(qf_all):<9.4f} {d:+.4f}')
+    print('='*90)
+    print('\nbase = loso baseline (no adaptation)')
+    print('online = full sim, q4 = last quarter (most adapted)')
+    print('df1 = q4 f1 - baseline f1')
+    if has_opening:
+        print('det% = fraction of hand openings where >= 1 positive window was caught')
 
 
 def plot_curves(results, path='online_learning_curves.png'):
@@ -359,7 +497,6 @@ def plot_curves(results, path='online_learning_curves.png'):
 
     for idx, (sub, r) in enumerate(results.items()):
         ax = axes[idx // 2][idx % 2]
-        # seed 0 only for plot — metrics table already averages all seeds
         sr = r['seeds'][0]
         x = np.arange(len(sr['run_acc']))
 
@@ -367,6 +504,14 @@ def plot_curves(results, path='online_learning_curves.png'):
                 color='steelblue', linewidth=1)
         ax.plot(x, sr['run_f1'], alpha=0.7, label='Running F1',
                 color='darkorange', linewidth=1)
+
+        if sr.get('oids'):
+            run_det = _running_detection_rate(
+                np.array(sr['trues']), np.array(sr['preds_list']),
+                np.array(sr['oids']))
+            if run_det is not None:
+                ax.plot(x, run_det, alpha=0.7, label='Running Det. Rate',
+                        color='green', linewidth=1)
 
         for i, up in enumerate(sr['updates']):
             if up < len(x):
@@ -379,7 +524,10 @@ def plot_curves(results, path='online_learning_curves.png'):
                    alpha=0.6, label=f'Baseline F1={r["baseline"]["f1"]:.3f}')
 
         tag = f' ({r["tag"]})' if r['tag'] == 'stroke' else ''
-        ax.set_title(f'{sub}{tag}')
+        det_str = ''
+        if 'opening' in sr:
+            det_str = f'  Det={sr["opening"]["detection_rate"]:.1%}'
+        ax.set_title(f'{sub}{tag}{det_str}')
         ax.set_xlabel('Window #')
         ax.set_ylabel('Metric (sliding window=100)')
         ax.set_ylim(0, 1.05)
@@ -388,13 +536,115 @@ def plot_curves(results, path='online_learning_curves.png'):
 
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches='tight')
-    print(f'\nPlot saved: {path}')
+    print(f'\nplot saved: {path}')
+
+
+def _running_detection_rate(trues, preds, oids):
+    n = len(trues)
+    if n == 0:
+        return None
+
+    # bail if not monotonic — means data was shuffled so running det rate is meaningless
+    if not np.all(np.diff(oids) >= 0):
+        return None
+
+    unique_oids = np.unique(oids)
+    instance_detected = {}
+    instance_last_idx = {}
+    for oid in unique_oids:
+        mask = oids == oid
+        gt = trues[mask]
+        pr = preds[mask]
+        if np.any(gt == 1):
+            instance_detected[oid] = bool(np.any(pr[gt == 1] == 1))
+            instance_last_idx[oid] = int(np.where(mask)[0][-1])
+
+    if not instance_detected:
+        return None
+
+    events = sorted((idx, det) for oid, det in instance_detected.items()
+                    for idx in [instance_last_idx[oid]])
+
+    run_det = np.full(n, np.nan)
+    ev_ptr = 0
+    cum_detected = 0
+    cum_total = 0
+    for i in range(n):
+        while ev_ptr < len(events) and events[ev_ptr][0] <= i:
+            cum_total += 1
+            if events[ev_ptr][1]:
+                cum_detected += 1
+            ev_ptr += 1
+        if cum_total > 0:
+            run_det[i] = cum_detected / cum_total
+
+    first_valid = np.argmax(~np.isnan(run_det))
+    run_det[:first_valid] = run_det[first_valid]
+
+    return run_det
+
+
+def plot_threshold_tradeoff(results, path='threshold_tradeoff.png'):
+    subjects_with_sweep = [(sub, r) for sub, r in results.items() if r.get('sweep')]
+    if not subjects_with_sweep:
+        return
+
+    n = len(subjects_with_sweep)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4.5), squeeze=False)
+    fig.suptitle('Opening Detection Rate vs False Positive Rate (Threshold Sweep)',
+                 fontsize=13, y=1.03)
+
+    for idx, (sub, r) in enumerate(subjects_with_sweep):
+        ax = axes[0][idx]
+        sweep = r['sweep']
+        threshs = [row['threshold'] for row in sweep]
+        det_rates = [row['det_rate'] for row in sweep]
+        fprs = [row['window_fpr'] for row in sweep]
+        f1s = [row['f1'] for row in sweep]
+
+        ax.plot(fprs, det_rates, 'o-', color='#2d8a4e', markersize=4, linewidth=1.5,
+                label='Det Rate vs FPR')
+
+        for i, th in enumerate(threshs):
+            if i % 2 == 0:
+                ax.annotate(f'{th:.2f}', (fprs[i], det_rates[i]),
+                            textcoords='offset points', xytext=(5, 5),
+                            fontsize=7, color='#555')
+
+        adapted_th = np.mean([s['threshold'] for s in r['seeds']])
+        closest_idx = np.argmin(np.abs(np.array(threshs) - adapted_th))
+        ax.plot(fprs[closest_idx], det_rates[closest_idx], '*',
+                color='red', markersize=12, label=f'Adapted thresh ({adapted_th:.2f})')
+
+        ax2 = ax.twinx()
+        ax2.plot(fprs, f1s, 's--', color='darkorange', markersize=3,
+                 linewidth=1, alpha=0.7, label='F1')
+        ax2.set_ylabel('F1 Score', fontsize=9, color='darkorange')
+        ax2.tick_params(axis='y', labelcolor='darkorange')
+        ax2.set_ylim(0, 1.05)
+
+        tag = f' ({r["tag"]})' if r['tag'] == 'stroke' else ''
+        ax.set_title(f'{sub}{tag}', fontsize=10, fontweight='bold')
+        ax.set_xlabel('Window False Positive Rate', fontsize=9)
+        ax.set_ylabel('Opening Detection Rate', fontsize=9)
+        ax.set_xlim(-0.02, max(fprs) * 1.1 + 0.02)
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.2)
+
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc='lower left')
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    print(f'threshold tradeoff plot saved: {path}')
 
 
 def generate_report(results, total_time, path='online_learning_report.png'):
-    fig = plt.figure(figsize=(12, 10))
-    fig.patch.set_facecolor('white')
+    has_opening = any(r.get('baseline_opening') is not None for r in results.values())
 
+    fig = plt.figure(figsize=(14, 12) if has_opening else (12, 10))
+    fig.patch.set_facecolor('white')
     font_family = 'Times New Roman'
 
     fig.text(0.5, 0.97, 'Summary',
@@ -404,10 +654,17 @@ def generate_report(results, total_time, path='online_learning_report.png'):
              ha='center', va='top', fontsize=11, color='#555555',
              fontfamily=font_family)
 
-    col_labels = ['Subject', 'Type', 'Base Acc', 'Base F1',
-                  'Online Acc', 'Online F1', 'Q4 F1', '\u0394F1']
+    if has_opening:
+        col_labels = ['Subject', 'Type', 'Base Acc', 'Base F1',
+                      'Online Acc', 'Online F1', 'Q4 F1',
+                      'Base Det%', 'Online Det%', '\u0394F1']
+    else:
+        col_labels = ['Subject', 'Type', 'Base Acc', 'Base F1',
+                      'Online Acc', 'Online F1', 'Q4 F1', '\u0394F1']
+
     table_data = []
     ba_all, bf_all, oa_all, of_all, qf_all = [], [], [], [], []
+    bd_all, od_all = [], []
 
     for idx, (sub, r) in enumerate(results.items()):
         ba, bf = r['baseline']['acc'], r['baseline']['f1']
@@ -415,30 +672,40 @@ def generate_report(results, total_time, path='online_learning_report.png'):
         of_ = np.mean([s['overall']['f1'] for s in r['seeds']])
         qf = np.mean([s['q4']['f1'] for s in r['seeds']])
         delta = qf - bf
-        table_data.append([
-            sub, r['tag'].capitalize(),
-            f'{ba:.4f}', f'{bf:.4f}',
-            f'{oa:.4f}', f'{of_:.4f}',
-            f'{qf:.4f}', f'{delta:+.4f}'
-        ])
+
+        row = [sub, r['tag'].capitalize(),
+               f'{ba:.4f}', f'{bf:.4f}',
+               f'{oa:.4f}', f'{of_:.4f}', f'{qf:.4f}']
+
+        if has_opening:
+            bd = r['baseline_opening']['detection_rate'] if r['baseline_opening'] else 0
+            od_vals = [s['opening']['detection_rate'] for s in r['seeds'] if 'opening' in s]
+            od = np.mean(od_vals) if od_vals else 0
+            row.extend([f'{bd:.1%}', f'{od:.1%}'])
+            bd_all.append(bd); od_all.append(od)
+
+        row.append(f'{delta:+.4f}')
+        table_data.append(row)
         ba_all.append(ba); bf_all.append(bf)
         oa_all.append(oa); of_all.append(of_)
         qf_all.append(qf)
 
     avg_delta = np.mean(qf_all) - np.mean(bf_all)
-    table_data.append([
-        'Average', '',
-        f'{np.mean(ba_all):.4f}', f'{np.mean(bf_all):.4f}',
-        f'{np.mean(oa_all):.4f}', f'{np.mean(of_all):.4f}',
-        f'{np.mean(qf_all):.4f}', f'{avg_delta:+.4f}'
-    ])
+    avg_row = ['Average', '',
+               f'{np.mean(ba_all):.4f}', f'{np.mean(bf_all):.4f}',
+               f'{np.mean(oa_all):.4f}', f'{np.mean(of_all):.4f}',
+               f'{np.mean(qf_all):.4f}']
+    if has_opening:
+        avg_row.extend([f'{np.mean(bd_all):.1%}', f'{np.mean(od_all):.1%}'])
+    avg_row.append(f'{avg_delta:+.4f}')
+    table_data.append(avg_row)
 
-    ax_table = fig.add_axes([0.05, 0.55, 0.9, 0.35])
+    ax_table = fig.add_axes([0.03, 0.55, 0.94, 0.35])
     ax_table.axis('off')
     table = ax_table.table(cellText=table_data, colLabels=col_labels,
                            loc='center', cellLoc='center')
     table.auto_set_font_size(False)
-    table.set_fontsize(10)
+    table.set_fontsize(9)
     table.scale(1.0, 1.6)
 
     for _, cell in table.get_celld().items():
@@ -455,9 +722,10 @@ def generate_report(results, total_time, path='online_learning_report.png'):
         cell.set_facecolor('#e8e8e8')
         cell.set_text_props(fontweight='bold')
 
+    delta_col = len(col_labels) - 1
     for i in range(1, len(table_data) + 1):
-        val = float(table_data[i-1][-1])
-        cell = table[i, len(col_labels)-1]
+        val = float(table_data[i-1][delta_col])
+        cell = table[i, delta_col]
         if val > 0:
             cell.set_text_props(color='#2d8a4e')
         elif val < 0:
@@ -478,7 +746,10 @@ def generate_report(results, total_time, path='online_learning_report.png'):
         ax.axhline(y=r['baseline']['f1'], color='darkorange', linestyle=':', alpha=0.5, linewidth=0.8)
         ax.axhline(y=r['baseline']['acc'], color='steelblue', linestyle=':', alpha=0.5, linewidth=0.8)
         tag = f' ({r["tag"]})' if r['tag'] == 'stroke' else ''
-        ax.set_title(f'{sub}{tag}', fontsize=9, fontweight='bold', fontfamily=font_family)
+        det_str = ''
+        if 'opening' in sr:
+            det_str = f'  Det={sr["opening"]["detection_rate"]:.1%}'
+        ax.set_title(f'{sub}{tag}{det_str}', fontsize=9, fontweight='bold', fontfamily=font_family)
         ax.set_ylim(0, 1.05)
         ax.set_xlabel('Window #', fontsize=7, fontfamily=font_family)
         ax.tick_params(labelsize=7)
@@ -487,26 +758,24 @@ def generate_report(results, total_time, path='online_learning_report.png'):
             ax.legend(fontsize=7, loc='lower right')
 
     plt.savefig(path, dpi=150, bbox_inches='tight', facecolor='white')
-    print(f'Report saved: {path}')
+    print(f'report saved: {path}')
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Online Learning CNN-LSTM for Hand Exoskeleton Intent Detection')
+    parser.add_argument('--mode', choices=['chrono', 'random', 'both'], default='chrono',
+                        help='chrono = chronological order (1 seed), '
+                             'random = shuffled (3 seeds), '
+                             'both = run both and compare')
+    args = parser.parse_args()
+
     total_start = time.time()
 
     print('='*60)
-    print('  Online Learning CNN-LSTM — Hand Exoskeleton Intent Detection')
+    print('  online learning cnn-lstm — hand exo intent detection')
     print('='*60)
-
-    # print('\nChecking GPU...')
-    # check_gpu()
-    print('\nRunning on CPU only.')
-
-    print('\nLoading data...')
-    sX, sy = load_data()
-    for i in range(4):
-        tag = 'stroke' if i == 3 else 'healthy'
-        print(f'  Subject {i+1} ({tag}): {len(sy[i])} windows '
-              f'({np.sum(sy[i]==1)} open, {np.sum(sy[i]==0)} not)')
+    print('\n running on cpu')
 
     config = dict(
         update_every=50,
@@ -518,15 +787,61 @@ if __name__ == '__main__':
         adapt_thresh=True,
         buf_cap=300,
     )
-    print(f'\nOnline learning config:')
+    print(f'\nonline learning config:')
     for k, v in config.items():
         print(f'  {k}: {v}')
 
-    results, experiment_time = run_experiment(sX, sy, config, n_seeds=3)
+    modes_to_run = ['chrono', 'random'] if args.mode == 'both' else [args.mode]
+
+    all_results = {}
+    for mode in modes_to_run:
+        chronological = (mode == 'chrono')
+        n_seeds = 1 if chronological else 3
+
+        print(f'\n{"#"*60}')
+        print(f'  mode: {"chronological" if chronological else "randomized"} '
+              f'({n_seeds} seed{"s" if n_seeds > 1 else ""})')
+        print(f'{"#"*60}')
+
+        print('\nloading data...')
+        sX, sy, s_info = load_data_chrono()
+        for i in range(4):
+            tag = 'stroke' if i == 3 else 'healthy'
+            n_instances = len(np.unique(s_info[i][:, 2]))
+            print(f'  subject {i+1} ({tag}): {len(sy[i])} windows '
+                  f'({np.sum(sy[i]==1)} open, {np.sum(sy[i]==0)} not), '
+                  f'{n_instances} opening instances')
+
+        results, experiment_time = run_experiment(
+            sX, sy, config, n_seeds=n_seeds,
+            subjects_info=s_info, chronological=chronological)
+
+        suffix = f'_{mode}'
+        print_summary(results)
+        plot_curves(results, path=f'online_learning_curves{suffix}.png')
+        generate_report(results, experiment_time, path=f'online_learning_report{suffix}.png')
+        plot_threshold_tradeoff(results, path=f'threshold_tradeoff{suffix}.png')
+
+        all_results[mode] = results
+
+    if args.mode == 'both' and len(all_results) == 2:
+        print(f'\n{"="*80}')
+        print('  chrono vs randomized comparison')
+        print(f'{"="*80}')
+        print(f'{"subject":<14} {"chrono f1":<11} {"random f1":<11} '
+              f'{"chrono det%":<13} {"random det%":<13} {"df1 (c-r)":<10}')
+        print('-'*80)
+        for sub in all_results['chrono']:
+            c = all_results['chrono'][sub]
+            r = all_results['random'][sub]
+            c_f1 = np.mean([s['overall']['f1'] for s in c['seeds']])
+            r_f1 = np.mean([s['overall']['f1'] for s in r['seeds']])
+            c_det = np.mean([s['opening']['detection_rate'] for s in c['seeds'] if 'opening' in s])
+            r_det = np.mean([s['opening']['detection_rate'] for s in r['seeds'] if 'opening' in s])
+            tag = f' ({c["tag"]})' if c['tag'] == 'stroke' else ''
+            print(f'{sub+tag:<14} {c_f1:<11.4f} {r_f1:<11.4f} '
+                  f'{c_det:<13.1%} {r_det:<13.1%} {c_f1-r_f1:+.4f}')
+        print('='*80)
 
     total_time = time.time() - total_start
-    print(f'\n  Total execution time: {fmt_time(total_time)}')
-
-    print_summary(results)
-    plot_curves(results)
-    generate_report(results, total_time)
+    print(f'\n  total time: {fmt_time(total_time)}')

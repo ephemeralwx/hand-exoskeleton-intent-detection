@@ -16,7 +16,7 @@ import time
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 tf.get_logger().setLevel('ERROR')
 
-# force cpu — model is too small for gpu to actually help, just adds overhead
+# model too small to benefit from gpu, overhead makes it slower
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 tf.config.set_visible_devices([], 'GPU')
 
@@ -104,7 +104,7 @@ def threshold_sweep(probs, y_true, opening_ids,
 
 
 def build_cnn_lstm(input_shape=(100, 8)):
-    # recurrent_dropout only works on cpu, thats fine since we force cpu anyway
+    # recurrent_dropout only works on cpu, fine since we force cpu
     return models.Sequential([
         layers.Conv1D(64, 5, activation='relu', input_shape=input_shape, name='conv1'),
         layers.MaxPooling1D(2, name='pool1'),
@@ -170,7 +170,7 @@ class OnlineLearner:
         self.oid_list = []
         self.update_pts = []
 
-        # freeze early conv layers — they learn general features, dont need to adapt those online
+        # early conv layers learn generic features, no need to adapt online
         if freeze_early:
             for layer in model.layers:
                 if layer.name in ('conv1', 'bn1'):
@@ -224,7 +224,7 @@ class OnlineLearner:
         y = np.array(self.buf_y)
 
         if len(X) > self.buf_cap:
-            # 60/40 recent/old split — bias toward recent data but keep some old to avoid catastrophic forgetting
+            # 60/40 recent/old — biased toward recent but keeping some old to avoid catastrophic forgetting
             recent_n = int(self.buf_cap * 0.6)
             old_n = self.buf_cap - recent_n
             old_pool = len(X) - recent_n
@@ -246,7 +246,7 @@ class OnlineLearner:
         y = np.array(self.buf_y[-self.buf_cap:])
         ps = self.model(tf.constant(X, dtype=tf.float32), training=False).numpy().flatten()
 
-        # below 0.15 is basically always false positive city, above 0.85 kills recall
+        # below 0.15 is false positive city, above 0.85 kills recall
         thresholds = np.arange(0.15, 0.85, 0.02)
         preds_all = (ps[np.newaxis, :] > thresholds[:, np.newaxis]).astype(int)
         y_broad = y[np.newaxis, :]
@@ -273,7 +273,7 @@ class OnlineLearner:
                     'prec': float(precision_score(t_, p_, zero_division=0)),
                     'rec': float(recall_score(t_, p_, zero_division=0))}
 
-        # 100 window sliding avg — smaller is too noisy, larger hides when adaptation actually kicks in
+        # 100 window sliding avg — smaller too noisy, larger hides when adaptation kicks in
         win = 100
         run_acc, run_f1 = [], []
         for i in range(n):
@@ -334,8 +334,8 @@ def run_experiment(subjects_X, subjects_y, config, n_seeds=3,
         X_te, y_te = subjects_X[ts], subjects_y[ts]
         oi = subjects_info[ts][:, 2] if subjects_info is not None else None
 
-        print(f'  train: {len(y_tr)} windows ({np.sum(y_tr==1)} pos, {np.sum(y_tr==0)} neg)')
-        print(f'  test:  {len(y_te)} windows ({np.sum(y_te==1)} pos, {np.sum(y_te==0)} neg)')
+        print(f'  train: {len(y_tr)} win ({np.sum(y_tr==1)} pos, {np.sum(y_tr==0)} neg)')
+        print(f'  test:  {len(y_te)} win ({np.sum(y_te==1)} pos, {np.sum(y_te==0)} neg)')
 
         step_start = time.time()
         print('  training base model...', end=' ', flush=True)
@@ -358,13 +358,13 @@ def run_experiment(subjects_X, subjects_y, config, n_seeds=3,
         b_opening = None
         if oi is not None:
             b_opening = compute_opening_metrics(y_te, bpred, oi)
-            print(f'  baseline opening detection: {b_opening["detected"]}/{b_opening["total_pos_instances"]} '
+            print(f'  baseline opening det: {b_opening["detected"]}/{b_opening["total_pos_instances"]} '
                   f'({b_opening["detection_rate"]:.1%}), '
-                  f'FP windows: {b_opening["fp_windows"]}/{b_opening["neg_windows"]} '
+                  f'FP win: {b_opening["fp_windows"]}/{b_opening["neg_windows"]} '
                   f'({b_opening["window_fpr"]:.1%})')
 
         print(f'  [time] elapsed: {fmt_time(elapsed)} | '
-              f'est. remaining: {fmt_time(remaining)} | '
+              f'est remaining: {fmt_time(remaining)} | '
               f'step {current_step}/{total_steps}')
 
         seeds = []
@@ -393,7 +393,7 @@ def run_experiment(subjects_X, subjects_y, config, n_seeds=3,
                   f'Q4 acc={r["q4"]["acc"]:.4f}, F1={r["q4"]["f1"]:.4f} | '
                   f'thresh={r["threshold"]:.2f}{det_str} ({fmt_time(step_elapsed)})')
             print(f'  [time] elapsed: {fmt_time(elapsed)} | '
-                  f'est. remaining: {fmt_time(remaining)} | '
+                  f'est remaining: {fmt_time(remaining)} | '
                   f'step {current_step}/{total_steps}')
 
         avg = lambda key, sub='overall': np.mean([s[sub][key] for s in seeds])
@@ -403,15 +403,33 @@ def run_experiment(subjects_X, subjects_y, config, n_seeds=3,
               f'acc {avg("acc","q4")-b_acc:+.4f}, F1 {avg("f1","q4")-b_f1:+.4f}')
 
         sweep = None
+        sweep_q4 = None
         if oi is not None:
             best_seed = max(seeds, key=lambda s: s['overall']['f1'])
             sweep = threshold_sweep(
                 best_seed['probs'], best_seed['trues'], best_seed['oids'])
-            print(f'\n  threshold vs detection/FP tradeoff ({name}, {tag}):')
+            print(f'\n  threshold sweep — full run ({name}, {tag}):')
             print(f'  {"thresh":<8} {"det_rate":<9} {"detected":<10} '
                   f'{"fp_win":<8} {"win_fpr":<9} {"f1":<6}')
             print(f'  {"-"*50}')
             for row in sweep:
+                print(f'  {row["threshold"]:<8.2f} {row["det_rate"]:<9.1%} '
+                      f'{row["detected"]}/{row["total_pos"]:<7} '
+                      f'{row["fp_windows"]:<8} {row["window_fpr"]:<9.1%} '
+                      f'{row["f1"]:<6.3f}')
+
+            # q4 sweep — model is most adapted here, better represents deployment
+            n_total = len(best_seed['probs'])
+            q4_start = 3 * (n_total // 4)
+            sweep_q4 = threshold_sweep(
+                best_seed['probs'][q4_start:],
+                best_seed['trues'][q4_start:],
+                best_seed['oids'][q4_start:])
+            print(f'\n  threshold sweep — Q4 only ({name}, {tag}):')
+            print(f'  {"thresh":<8} {"det_rate":<9} {"detected":<10} '
+                  f'{"fp_win":<8} {"win_fpr":<9} {"f1":<6}')
+            print(f'  {"-"*50}')
+            for row in sweep_q4:
                 print(f'  {row["threshold"]:<8.2f} {row["det_rate"]:<9.1%} '
                       f'{row["detected"]}/{row["total_pos"]:<7} '
                       f'{row["fp_windows"]:<8} {row["window_fpr"]:<9.1%} '
@@ -423,6 +441,7 @@ def run_experiment(subjects_X, subjects_y, config, n_seeds=3,
             'seeds': seeds,
             'tag': tag,
             'sweep': sweep,
+            'sweep_q4': sweep_q4,
         }
 
     return results, time.time() - exp_start
@@ -488,7 +507,7 @@ def print_summary(results):
     print('online = full sim, q4 = last quarter (most adapted)')
     print('df1 = q4 f1 - baseline f1')
     if has_opening:
-        print('det% = fraction of hand openings where >= 1 positive window was caught')
+        print('det% = fraction of openings where >= 1 positive window caught')
 
 
 def plot_curves(results, path='online_learning_curves.png'):
@@ -544,7 +563,7 @@ def _running_detection_rate(trues, preds, oids):
     if n == 0:
         return None
 
-    # bail if not monotonic — means data was shuffled so running det rate is meaningless
+    # bail if not monotonic — data was shuffled so running det rate is meaningless
     if not np.all(np.diff(oids) >= 0):
         return None
 
@@ -808,7 +827,7 @@ if __name__ == '__main__':
         for i in range(4):
             tag = 'stroke' if i == 3 else 'healthy'
             n_instances = len(np.unique(s_info[i][:, 2]))
-            print(f'  subject {i+1} ({tag}): {len(sy[i])} windows '
+            print(f'  subject {i+1} ({tag}): {len(sy[i])} win '
                   f'({np.sum(sy[i]==1)} open, {np.sum(sy[i]==0)} not), '
                   f'{n_instances} opening instances')
 
